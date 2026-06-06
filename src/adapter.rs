@@ -273,6 +273,8 @@ pub struct AdapterRouter {
     prompt_hard_timeout: std::time::Duration,
     /// Polling cadence for the recv-loop liveness check (#732).
     liveness_check_interval: std::time::Duration,
+    /// Cut early if no ACP event arrives for this long (0 = disabled).
+    acp_inactivity_timeout: std::time::Duration,
 }
 
 impl AdapterRouter {
@@ -282,6 +284,7 @@ impl AdapterRouter {
         table_mode: TableMode,
         prompt_hard_timeout_secs: u64,
         liveness_check_secs: u64,
+        acp_inactivity_timeout_secs: u64,
     ) -> Self {
         if liveness_check_secs >= prompt_hard_timeout_secs {
             warn!(
@@ -298,6 +301,7 @@ impl AdapterRouter {
             table_mode,
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
+            acp_inactivity_timeout: std::time::Duration::from_secs(acp_inactivity_timeout_secs),
         }
     }
 
@@ -464,6 +468,7 @@ impl AdapterRouter {
         let tool_display = self.reactions_config.tool_display;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        let acp_inactivity_timeout = self.acp_inactivity_timeout;
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -530,6 +535,7 @@ impl AdapterRouter {
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
                     let prompt_start = tokio::time::Instant::now();
+                    let mut last_acp_event = tokio::time::Instant::now();
                     loop {
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
@@ -543,17 +549,34 @@ impl AdapterRouter {
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
+                                // Cut early if no ACP event has arrived for a while.
+                                // Catches mid-turn LLM hangs that produce no notifications
+                                // (e.g. large context → slow / timed-out OpenAI call).
+                                if !acp_inactivity_timeout.is_zero()
+                                    && last_acp_event.elapsed() > acp_inactivity_timeout
+                                {
+                                    response_error = Some(format!(
+                                        "Agent stopped responding (no activity for {}s)",
+                                        acp_inactivity_timeout.as_secs()
+                                    ));
+                                    conn.force_recreate = true;
+                                    conn.abandon_request(request_id).await;
+                                    break;
+                                }
                                 if prompt_start.elapsed() > prompt_hard_timeout {
                                     response_error = Some(format!(
                                         "Agent exceeded hard timeout ({}s)",
                                         prompt_hard_timeout.as_secs(),
                                     ));
+                                    conn.force_recreate = true;
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
                                 continue;
                             }
                         };
+                        // Any ACP event resets the inactivity clock.
+                        last_acp_event = tokio::time::Instant::now();
                         if let Some(notification_id) = notification.id {
                             if notification_id != request_id {
                                 // Stale response from a previously-abandoned prompt.
@@ -669,6 +692,8 @@ impl AdapterRouter {
                     };
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
+                    let content_preview = preview_chars(&final_content, 80);
+                    tracing::debug!(content_len = final_content.len(), content_preview = %content_preview, "final content before chunking");
                     let chunks = format::split_message(&final_content, message_limit);
                     if let Some(msg) = placeholder_msg {
                         if let Some(ref reply_id) = directives.reply_to {
@@ -701,10 +726,16 @@ impl AdapterRouter {
                         } else {
                             // Normal streaming: edit first chunk into placeholder, send rest
                             if let Some(first) = chunks.first() {
-                                let _ = adapter.edit_message(&msg, first).await;
+                                if let Err(e) = adapter.edit_message(&msg, first).await {
+                                    tracing::warn!(error = ?e, content_len = first.len(), "final edit_message failed");
+                                }
+                            } else {
+                                tracing::warn!("final chunks empty, nothing to edit into placeholder");
                             }
                             for chunk in chunks.iter().skip(1) {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                                if let Err(e) = adapter.send_message(&thread_channel, chunk).await {
+                                    tracing::warn!(error = ?e, "overflow chunk send_message failed");
+                                }
                             }
                         }
                     } else {
@@ -742,6 +773,10 @@ fn sanitize_title(title: &str) -> String {
         .replace('\r', "")
         .replace('\n', " ; ")
         .replace('`', "'")
+}
+
+fn preview_chars(content: &str, limit: usize) -> String {
+    content.chars().take(limit).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -981,6 +1016,12 @@ mod tests {
             ..ch.clone()
         };
         assert_eq!(thread_ch.origin_event_id.as_deref(), Some("evt_abc"));
+    }
+
+    #[test]
+    fn preview_chars_does_not_split_utf8() {
+        let input = "1234567890😀中文";
+        assert_eq!(preview_chars(input, 11), "1234567890😀");
     }
 
     fn tool(id: &str, title: &str, state: ToolState) -> ToolEntry {
